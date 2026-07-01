@@ -1,0 +1,4 @@
+python-telegram-bot==22.3
+requests==2.32.3
+httpx==0.28.1
+urllib3==2.5.0
