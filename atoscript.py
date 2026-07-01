@@ -9,30 +9,10 @@ import json as _json
 import logging
 import os
 import random
-import subprocess
 import time
 from datetime import datetime, timezone
 
-# Save proxy BEFORE cleanup — needed for Telegram API, but not for AtomicBux
-_SAVED_PROXY = (
-    os.environ.get("HTTPS_PROXY")
-    or os.environ.get("https_proxy")
-    or os.environ.get("HTTP_PROXY")
-    or os.environ.get("http_proxy")
-)
-
-# Kill ALL proxy env vars — so curl/requests bypass proxy for AtomicBux API
-for _k in list(os.environ.keys()):
-    if "proxy" in _k.lower():
-        del os.environ[_k]
-os.environ["NO_PROXY"] = "*"
-os.environ["no_proxy"] = "*"
-
 import requests as req
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-import httpx as _httpx
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.request import HTTPXRequest
@@ -61,7 +41,7 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # ============================================
 
-BOT_TOKEN = "8952586022:AAE7MZu1Hb2mHhcS1quRh290pRWuCmK_q3E"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8952586022:AAE7MZu1Hb2mHhcS1quRh290pRWuCmK_q3E")
 
 PROVIDERS = [
     "adexium",
@@ -110,73 +90,37 @@ def _headers(token: str) -> dict[str, str]:
         "referer": "https://atomicbux.online/",
     }
 
-# Create a session that completely ignores system proxy & env vars
+# Create a session that bypasses system proxy & env vars for AtomicBux API
 _session = req.Session()
 _session.trust_env = False
 _session.verify = False
 _session.proxies = {"http": "", "https": ""}
 
 
-def _curl_get(url: str, headers: dict[str, str], timeout: int = 15) -> tuple[int, str]:
-    """Use curl subprocess to completely bypass Python proxy issues."""
-    cmd = [
-        "curl", "-s", "-o", "-", "-w", "\n%{http_code}",
-        "--noproxy", "*",
-        "--connect-timeout", "5",
-        "--max-time", str(timeout),
-        "-k",  # skip SSL verify
-    ]
-    for k, v in headers.items():
-        cmd += ["-H", f"{k}: {v}"]
-    cmd.append(url)
+def _api_get(url: str, headers: dict[str, str], timeout: int = 15) -> tuple[int, str]:
+    """GET request via requests Session (proxy-safe, cross-platform)."""
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout + 5,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        lines = result.stdout.rsplit("\n", 1)
-        if len(lines) == 2:
-            body, status_str = lines
-            return int(status_str.strip()), body
-        return 0, result.stdout
-    except subprocess.TimeoutExpired:
+        resp = _session.get(url, headers=headers, timeout=timeout)
+        return resp.status_code, resp.text
+    except req.exceptions.Timeout:
         return 0, "Request timed out"
     except Exception as e:
         return 0, str(e)
 
 
-def _curl_post(url: str, headers: dict[str, str], data: dict, timeout: int = 15) -> tuple[int, str]:
-    """Use curl subprocess for POST requests."""
-    cmd = [
-        "curl", "-s", "-o", "-", "-w", "\n%{http_code}",
-        "--noproxy", "*",
-        "--connect-timeout", "5",
-        "--max-time", str(timeout),
-        "-k",
-        "-X", "POST",
-        "-d", _json.dumps(data),
-    ]
-    for k, v in headers.items():
-        cmd += ["-H", f"{k}: {v}"]
-    cmd.append(url)
+def _api_post(url: str, headers: dict[str, str], data: dict, timeout: int = 15) -> tuple[int, str]:
+    """POST request via requests Session (proxy-safe, cross-platform)."""
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout + 5,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        lines = result.stdout.rsplit("\n", 1)
-        if len(lines) == 2:
-            body, status_str = lines
-            return int(status_str.strip()), body
-        return 0, result.stdout
-    except subprocess.TimeoutExpired:
+        resp = _session.post(url, headers=headers, json=data, timeout=timeout)
+        return resp.status_code, resp.text
+    except req.exceptions.Timeout:
         return 0, "Request timed out"
     except Exception as e:
         return 0, str(e)
 
 
 def _sync_get_balance(token: str) -> float | None:
-    status, body = _curl_get(f"{API_BASE}/user", _headers(token))
+    status, body = _api_get(f"{API_BASE}/user", _headers(token))
     logger.info("get_balance: status=%d", status)
     if status == 200:
         try:
@@ -192,7 +136,7 @@ async def get_balance(token: str) -> float | None:
 
 
 def _sync_watch_ad(token: str, provider: str) -> bool:
-    status, body = _curl_post(
+    status, body = _api_post(
         f"{API_BASE}/watch-ad", _headers(token), {"provider": provider}
     )
     if status == 200:
@@ -212,7 +156,7 @@ async def watch_ad(token: str, provider: str) -> bool:
 
 def _sync_validate_token(token: str) -> tuple[bool, int, str]:
     logger.info("validate_token: starting request to %s", API_BASE)
-    status, body = _curl_get(f"{API_BASE}/user", _headers(token), timeout=15)
+    status, body = _api_get(f"{API_BASE}/user", _headers(token), timeout=15)
     logger.info("validate_token: got status=%d body=%s", status, body[:200])
     return (status == 200, status, body[:300])
 
@@ -574,12 +518,19 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ============================================
 
 
-def main() -> None:
+async def main() -> None:
     """Start the bot."""
-    # Use saved system proxy for Telegram API (required on servers behind proxy)
-    # AtomicBux calls use curl --noproxy to bypass proxy separately
+    # Build HTTPXRequest for Telegram API
+    # On Render (no proxy), proxy=None is fine; httpx uses direct connection
+    # On corporate proxy servers, set HTTPS_PROXY env var and it will be picked up
+    telegram_proxy = (
+        os.environ.get("TELEGRAM_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("HTTP_PROXY")
+        or None
+    )
     _request = HTTPXRequest(
-        proxy=_SAVED_PROXY,
+        proxy=telegram_proxy,
         connect_timeout=15.0,
         read_timeout=30.0,
         write_timeout=30.0,
@@ -605,9 +556,25 @@ def main() -> None:
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(cb_stop_task, pattern="^stop_task$"))
 
-    logger.info("Bot started! Telegram proxy: %s", _SAVED_PROXY or "none")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot started! Telegram proxy: %s", telegram_proxy or "none")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+
+    # Keep running until interrupted
+    stop_event = asyncio.Event()
+    try:
+        await stop_event.wait()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
